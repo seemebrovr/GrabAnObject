@@ -91,6 +91,7 @@ function spawnGrabbableCube(pos: Vector3, scale: Vector3, rot: Quaternion, color
   // Grab anywhere within grabReach of the cube's surface.
   grabbable.make(cube, grabReach, {
     grabBox: new Vector3(scale.x / 2, scale.y / 2, scale.z / 2),
+    snapGrid: 0.1, // 10cm grid, used when Snap is turned on in the property panel
     onGrab: (hand) => console.log(hand + ' hand grabbed a cube'),
     onRelease: (hand) => console.log(hand + ' hand released a cube'),
   });

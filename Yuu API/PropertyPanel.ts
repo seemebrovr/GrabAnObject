@@ -11,20 +11,23 @@ import { spawnPrimitive } from "./SpawnPrimitive";
 // ============================================================================
 // PropertyPanel - a small in-world property panel for an entity.
 // ----------------------------------------------------------------------------
-// Currently shows one property:
-//   "Physics" - a toggle that switches the object between:
-//       On  -> a normal physics body (falls under gravity, can be thrown)
-//       Off -> frozen in place (no falling, no spinning)
-// There is also an X button to close the panel.
-//
-// The panel is operated with the ray pointer: aim a hand at a button and pull
-// the trigger to click it.
+// Properties:
+//   "Physics"  - On: falls / can be thrown.  Off: frozen in place.
+//   "Snap"     - On: releasing snaps the object to a grid (great for building).
+//   "Duplicate"- spawns a copy (handler supplied by the caller).
+//   "X"        - close the panel.
+// Operate it with the ray pointer: aim a hand at a button and pull the trigger.
 // ============================================================================
 
 
 type ButtonHandle = {
-  root: Entity,   // background plane; carries the collider + ray-click
-  label: Entity,  // text child, kept so the caption can be updated
+  root: Entity,
+  label: Entity,
+}
+
+type OpenOptions = {
+  /** If provided, a "Duplicate" button appears that calls this with the target. */
+  onDuplicate?: (target: Entity) => void,
 }
 
 
@@ -46,6 +49,7 @@ export const propertyPanel = {
 
 let panelRoot: Entity | undefined;
 let physicsButton: ButtonHandle | undefined;
+let snapButton: ButtonHandle | undefined;
 
 
 function isOpen(): boolean {
@@ -58,42 +62,23 @@ function getPhysicsEnabled(entity: Entity): boolean {
 
 function setPhysicsEnabled(entity: Entity, enabled: boolean): void {
   physicsEnabled.set(entity, enabled);
-
-  // Drop any stored frozen pose so the freeze loop re-captures the object's
-  // current pose next time (it may have just been moved or resized).
   frozen.delete(entity);
 }
 
-/**
- * Override the pinned pose used while an entity has physics OFF. Lets another
- * system (e.g. the scale gizmo) move/resize the object without the freeze loop
- * fighting it back to an old pose.
- */
 function setFrozenPose(entity: Entity, pos: Vector3, rot: Quaternion): void {
   frozen.set(entity, { pos: pos.clone(), rot: rot.clone() });
 }
 
 
-type OpenOptions = {
-  /** If provided, a "Duplicate" button appears that calls this with the target. */
-  onDuplicate?: (target: Entity) => void,
-}
-
-/**
- * Open the property panel for an entity (closing any panel already open).
- * The panel floats just above the entity and faces the player.
- */
 function open(target: Entity, options: OpenOptions = {}): void {
   close();
 
-  // Float above the object, nudged toward the player. A 'Front' plane with no
-  // rotation faces +Z, which is toward the player in this scene.
-  const anchor = target.pos.add(new Vector3(0, 0.32, 0.12));
+  const anchor = target.pos.add(new Vector3(0, 0.35, 0.12));
 
   panelRoot = spawnPrimitive.plane(
     'Front',
     anchor,
-    new Vector3(0.34, 0.30, 1),
+    new Vector3(0.34, 0.36, 1),
     Quaternion.one,
     new Color(0.12, 0.12, 0.14),
     1,
@@ -102,13 +87,12 @@ function open(target: Entity, options: OpenOptions = {}): void {
     undefined
   );
 
-  // Title.
-  addLabel(panelRoot, new Vector3(0, 0.11, 0.002), 'Properties', 5, Color.white);
+  addLabel(panelRoot, new Vector3(0, 0.14, 0.002), 'Properties', 5, Color.white);
 
   // X close button (top-right corner).
   const closeButton = makeButton(
     panelRoot,
-    new Vector3(0.145, 0.115, 0.002),
+    new Vector3(0.145, 0.145, 0.002),
     new Vector3(0.04, 0.04, 1),
     'X',
     5,
@@ -117,13 +101,13 @@ function open(target: Entity, options: OpenOptions = {}): void {
   );
   closeButton.root.rayClick.setClickFunction(() => close());
 
-  // "Physics" property row: a label on the left, a toggle button on the right.
-  addLabel(panelRoot, new Vector3(-0.08, 0.02, 0.002), 'Physics', 4, Color.white);
+  // Physics on/off row.
+  addLabel(panelRoot, new Vector3(-0.085, 0.06, 0.002), 'Physics', 4, Color.white);
 
   physicsButton = makeButton(
     panelRoot,
-    new Vector3(0.08, 0.02, 0.002),
-    new Vector3(0.12, 0.07, 1),
+    new Vector3(0.07, 0.06, 0.002),
+    new Vector3(0.12, 0.06, 1),
     physicsCaption(target),
     4,
     physicsColor(target),
@@ -134,14 +118,31 @@ function open(target: Entity, options: OpenOptions = {}): void {
     refreshPhysicsButton(target);
   });
 
+  // Snap on/off row.
+  addLabel(panelRoot, new Vector3(-0.085, -0.01, 0.002), 'Snap', 4, Color.white);
+
+  snapButton = makeButton(
+    panelRoot,
+    new Vector3(0.07, -0.01, 0.002),
+    new Vector3(0.12, 0.06, 1),
+    snapCaption(target),
+    4,
+    snapColor(target),
+    Color.white
+  );
+  snapButton.root.rayClick.setClickFunction(() => {
+    grabbable.setSnapEnabled(target, !grabbable.getSnapEnabled(target));
+    refreshSnapButton(target);
+  });
+
   // Duplicate button (only shown if the caller provided a duplicate handler).
   if (options.onDuplicate) {
     const onDuplicate = options.onDuplicate;
 
     const dupButton = makeButton(
       panelRoot,
-      new Vector3(0, -0.09, 0.002),
-      new Vector3(0.22, 0.06, 1),
+      new Vector3(0, -0.11, 0.002),
+      new Vector3(0.24, 0.06, 1),
       'Duplicate',
       4,
       new Color(0.2, 0.35, 0.6),
@@ -158,6 +159,7 @@ function close(): void {
 
   panelRoot = undefined;
   physicsButton = undefined;
+  snapButton = undefined;
 }
 
 
@@ -173,6 +175,21 @@ function refreshPhysicsButton(target: Entity): void {
   if (physicsButton) {
     physicsButton.label.text.display.set(physicsCaption(target));
     physicsButton.root.mesh.color.set(physicsColor(target), 1);
+  }
+}
+
+function snapCaption(target: Entity): string {
+  return grabbable.getSnapEnabled(target) ? 'On' : 'Off';
+}
+
+function snapColor(target: Entity): Color {
+  return grabbable.getSnapEnabled(target) ? new Color(0.18, 0.5, 0.2) : new Color(0.4, 0.4, 0.45);
+}
+
+function refreshSnapButton(target: Entity): void {
+  if (snapButton) {
+    snapButton.label.text.display.set(snapCaption(target));
+    snapButton.root.mesh.color.set(snapColor(target), 1);
   }
 }
 
@@ -215,9 +232,6 @@ function makeButton(parent: Entity, pos: Vector3, scale: Vector3, text: string, 
 
 
 // --- "physics off" freeze loop ---------------------------------------------
-// While an entity has physics disabled and is not being held, pin it in place so
-// gravity can't move it. When held, the grab system controls it and we re-pin on
-// release.
 
 registerStart(start);
 function start() {
@@ -242,8 +256,6 @@ function onPhysicsUpdate(deltaTime: number) {
       frozen.set(entity, pin);
     }
 
-    // Pin position AND rotation and clear linear velocity, so the object is
-    // completely still while physics is off (no falling, no spinning).
     entity.pos = pin.pos;
     entity.rot = pin.rot;
     entity.velocity.set(Vector3.zero);

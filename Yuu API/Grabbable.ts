@@ -7,54 +7,46 @@ import { Player } from "./Player";
 import { registerStart } from "./RegisterStart";
 
 
-// Proximity grab with preserved offset and throw-on-release.
-//
-// Supports one- OR two-handed holding:
-//   - One hand:  the object tracks that hand's position AND rotation, keeping
-//                whatever offset it had when grabbed.
-//   - Two hands: the object tracks the midpoint between the two hands. Its
-//                orientation is held fixed (no two-handed rotation) - moving the
-//                hands slides it around, but does not turn it.
-//
-// Grabbing with a second hand, or releasing one of two hands, re-captures the
-// offset so control passes smoothly without the object snapping.
-//
-// While held, the object's velocity is driven each physics frame so it tracks the
-// grab frame (this overrides gravity). On full release we stop driving it, so the
-// velocity from the last frame remains and the object is thrown with that motion.
-//
-// The grabbed entity must be of type 'Physics' for velocity (and throwing) to work.
+// Proximity grab with preserved offset and throw-on-release. Supports one- or
+// two-handed holding, surface grabbing, optional grid snapping, and avoids
+// launching the player:
+//   - While held, an object is "ghosted" (collision off) so it can't shove the
+//     player or jitter against the world, and follows the hand smoothly.
+//   - A non-held object near the player's body is also ghosted + pinned, so you
+//     pass through it instead of being thrown (the engine exposes no collision
+//     layers or player-velocity control, so this is the available approach).
+//   - With snapping enabled, releasing snaps position to a grid and rotation to
+//     axis-aligned (and does not throw).
 
 
 export type Hand = 'Left' | 'Right';
 
 export type GrabbableOptions = {
-  /** Called when a hand grabs this entity (fires for each hand) */
   onGrab?: (hand: Hand) => void,
-  /** Called when a hand releases this entity (fires for each hand) */
   onRelease?: (hand: Hand) => void,
-  /**
-   * Local-space points (offsets from the entity's center, in meters) the hand
-   * must be near to grab. If omitted, grabBox or the entity's center is used.
-   */
+  /** Discrete local-space anchor points to grab near (used if grabBox is unset). */
   grabPoints?: Vector3[],
-  /**
-   * Local half-extents of a box. If set, the hand can grab anywhere within
-   * grabRadius of the box's SURFACE (not just discrete points) - best for cubes
-   * and stretched boxes. Takes priority over grabPoints.
-   */
+  /** Local half-extents; if set, grab anywhere within grabRadius of the box surface. */
   grabBox?: Vector3,
+  /** Grid cell size (meters) used when snapping is enabled. 0 = never snap. */
+  snapGrid?: number,
 }
+
+type Pose = { pos: Vector3, rot: Quaternion };
 
 type GrabbableState = {
   entity: Entity,
   grabRadius: number,
   options: GrabbableOptions,
-  grabPoints: Vector3[],        // local-space grab anchors; empty means "use the center"
-  grabBox: Vector3 | undefined, // local half-extents for grabbing anywhere on the surface
-  heldBy: Hand[],               // hands currently holding this: 0, 1, or 2
-  localPosOffset: Vector3,    // object position relative to the grab frame, in frame-local space
-  localRotOffset: Quaternion, // object rotation relative to the grab frame
+  grabPoints: Vector3[],
+  grabBox: Vector3 | undefined,
+  snapGrid: number,
+  snapEnabled: boolean,
+  heldBy: Hand[],
+  localPosOffset: Vector3,
+  localRotOffset: Quaternion,
+  shielded: boolean,            // currently phased out because the player body is close
+  shieldPose: Pose | undefined, // pose to hold while shielded
 }
 
 
@@ -66,6 +58,9 @@ const handHeld = new Map<Hand, GrabbableState | undefined>([
   ['Right', undefined],
 ]);
 
+// How close the player's body may get to a non-held object before it phases out.
+const playerBodyReach = 0.25;
+
 
 export const grabbable = {
   make,
@@ -76,16 +71,11 @@ export const grabbable = {
   heldEntity,
   setGrabPoints,
   setGrabBox,
+  setSnapEnabled,
+  getSnapEnabled,
 }
 
 
-/**
- * Register an entity so it can be grabbed when a hand is within range and the grip is squeezed.
- * Can be grabbed by either hand, or both hands at once.
- * @param entity the entity to make grabbable (should be a 'Physics' entity so it can be thrown)
- * @param grabRadius how close (in meters) a hand must be to grab it, defaults to 0.2
- * @param options optional onGrab / onRelease callbacks
- */
 function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOptions = {}): void {
   if (entity.type !== 'Physics') {
     console.log('grabbable.make: entity should be a Physics entity for throw-on-release to work.');
@@ -97,15 +87,16 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     options: options,
     grabPoints: options.grabPoints ?? [],
     grabBox: options.grabBox,
+    snapGrid: options.snapGrid ?? 0,
+    snapEnabled: false,
     heldBy: [],
     localPosOffset: Vector3.zero,
     localRotOffset: Quaternion.one,
+    shielded: false,
+    shieldPose: undefined,
   });
 }
 
-/**
- * Remove an entity from the grabbable system (releasing it from any hands first)
- */
 function remove(entity: Entity): void {
   const state = grabbables.get(entity);
 
@@ -116,27 +107,22 @@ function remove(entity: Entity): void {
   grabbables.delete(entity);
 }
 
-/**
- * @returns true if the entity is currently being held by at least one hand
- */
 function isHeld(entity: Entity): boolean {
   const state = grabbables.get(entity);
 
   return state !== undefined && state.heldBy.length > 0;
 }
 
-/**
- * @returns the hands currently holding the entity: [], ['Left'], ['Right'], or both
- */
 function heldBy(entity: Entity): Hand[] {
   const state = grabbables.get(entity);
 
   return state ? [...state.heldBy] : [];
 }
 
-/**
- * Replace the local-space grab points for an entity (e.g. after it has been resized).
- */
+function heldEntity(hand: Hand): Entity | undefined {
+  return handHeld.get(hand)?.entity;
+}
+
 function setGrabPoints(entity: Entity, points: Vector3[]): void {
   const state = grabbables.get(entity);
 
@@ -145,9 +131,6 @@ function setGrabPoints(entity: Entity, points: Vector3[]): void {
   }
 }
 
-/**
- * Replace the box half-extents used for surface grabbing (e.g. after a resize).
- */
 function setGrabBox(entity: Entity, halfExtents: Vector3): void {
   const state = grabbables.get(entity);
 
@@ -156,16 +139,18 @@ function setGrabBox(entity: Entity, halfExtents: Vector3): void {
   }
 }
 
-/**
- * @returns the entity a given hand is currently holding, or undefined
- */
-function heldEntity(hand: Hand): Entity | undefined {
-  return handHeld.get(hand)?.entity;
+function setSnapEnabled(entity: Entity, enabled: boolean): void {
+  const state = grabbables.get(entity);
+
+  if (state) {
+    state.snapEnabled = enabled;
+  }
 }
 
-/**
- * Release whatever both hands are currently holding
- */
+function getSnapEnabled(entity: Entity): boolean {
+  return grabbables.get(entity)?.snapEnabled ?? false;
+}
+
 function releaseAll(): void {
   release('Left');
   release('Right');
@@ -181,13 +166,6 @@ function getHandRot(hand: Hand): Quaternion | undefined {
 }
 
 
-/**
- * The "grab frame" is the moving reference the held object is locked to:
- *   - one hand:  origin = hand position, rot = hand rotation
- *   - two hands: origin = midpoint of the hands, rot = identity (a non-rotating
- *                frame, so the object keeps a fixed orientation)
- * Returns undefined if a required hand transform isn't available this frame.
- */
 function getGrabFrame(state: GrabbableState): { origin: Vector3, rot: Quaternion } | undefined {
   if (state.heldBy.length === 1) {
     const pos = getHandPos(state.heldBy[0]);
@@ -208,18 +186,12 @@ function getGrabFrame(state: GrabbableState): { origin: Vector3, rot: Quaternion
       return undefined;
     }
 
-    // Midpoint, with a fixed (identity) orientation -> position follows the hands,
-    // rotation stays put.
     return { origin: posA.lerp(posB, 0.5), rot: Quaternion.one };
   }
 
   return undefined;
 }
 
-/**
- * Capture the object's current offset from the current grab frame, so that
- * changing which hands hold it doesn't make it jump.
- */
 function captureOffset(state: GrabbableState): void {
   const frame = getGrabFrame(state);
 
@@ -234,31 +206,38 @@ function captureOffset(state: GrabbableState): void {
 }
 
 
-/**
- * Distance from a hand to where this grabbable can be grabbed.
- *  - grabBox set:     distance to the box SURFACE (grab anywhere near any face).
- *  - grabPoints set:  distance to the nearest discrete anchor point.
- *  - neither:         distance to the entity's center.
- * All shapes rotate and move with the entity.
- */
-function handGrabDistance(state: GrabbableState, handPos: Vector3): number {
-  // Box surface distance (signed-distance-field of an axis-aligned box, in local space).
+// Signed distance from a world point to an axis-aligned box (in the box's local
+// frame). Negative inside, positive outside, 0 on the surface.
+function boxSurfaceDistance(center: Vector3, rot: Quaternion, half: Vector3, point: Vector3): number {
+  const local = rot.inverse().rotateVector(point.subtract(center));
+
+  const qx = Math.abs(local.x) - half.x;
+  const qy = Math.abs(local.y) - half.y;
+  const qz = Math.abs(local.z) - half.z;
+
+  const ox = Math.max(qx, 0);
+  const oy = Math.max(qy, 0);
+  const oz = Math.max(qz, 0);
+
+  const outside = Math.sqrt((ox * ox) + (oy * oy) + (oz * oz));
+  const inside = Math.min(Math.max(qx, qy, qz), 0);
+
+  return outside + inside;
+}
+
+function halfExtentsOf(state: GrabbableState): Vector3 {
   if (state.grabBox) {
-    const local = state.entity.rot.inverse().rotateVector(handPos.subtract(state.entity.pos));
-    const h = state.grabBox;
+    return state.grabBox;
+  }
 
-    const qx = Math.abs(local.x) - h.x;
-    const qy = Math.abs(local.y) - h.y;
-    const qz = Math.abs(local.z) - h.z;
+  const s = state.entity.scale;
 
-    const ox = Math.max(qx, 0);
-    const oy = Math.max(qy, 0);
-    const oz = Math.max(qz, 0);
+  return new Vector3(s.x / 2, s.y / 2, s.z / 2);
+}
 
-    const outside = Math.sqrt((ox * ox) + (oy * oy) + (oz * oz));
-    const inside = Math.min(Math.max(qx, qy, qz), 0);
-
-    return Math.abs(outside + inside);
+function handGrabDistance(state: GrabbableState, handPos: Vector3): number {
+  if (state.grabBox) {
+    return Math.abs(boxSurfaceDistance(state.entity.pos, state.entity.rot, state.grabBox, handPos));
   }
 
   if (state.grabPoints.length > 0) {
@@ -282,9 +261,10 @@ function handGrabDistance(state: GrabbableState, handPos: Vector3): number {
   return state.entity.pos.distanceTo(handPos);
 }
 
+
 function tryGrab(hand: Hand): void {
   if (handHeld.get(hand)) {
-    return; // this hand is already holding something
+    return;
   }
 
   const handPos = getHandPos(hand);
@@ -293,8 +273,6 @@ function tryGrab(hand: Hand): void {
     return;
   }
 
-  // Find the nearest grabbable within range that this hand isn't already holding.
-  // An object held by the OTHER hand is allowed -> that becomes a two-handed grab.
   let nearest: GrabbableState | undefined;
   let nearestDist = Infinity;
 
@@ -315,10 +293,21 @@ function tryGrab(hand: Hand): void {
     return;
   }
 
+  const wasUnheld = nearest.heldBy.length === 0;
+
   nearest.heldBy.push(hand);
   handHeld.set(hand, nearest);
 
-  // Re-capture against the new grab frame (now possibly two-handed).
+  // Ghost the object while held so it can't shove the player or snag on the world.
+  if (wasUnheld) {
+    if (nearest.shielded) {
+      nearest.shielded = false;
+      nearest.shieldPose = undefined;
+    }
+
+    nearest.entity.collidable.set(false);
+  }
+
   captureOffset(nearest);
 
   nearest.options.onGrab?.(hand);
@@ -334,17 +323,33 @@ function release(hand: Hand): void {
   state.heldBy = state.heldBy.filter((h) => h !== hand);
   handHeld.set(hand, undefined);
 
-  // If another hand is still holding it, re-capture against the new (single-hand)
-  // frame so control passes smoothly instead of snapping.
   if (state.heldBy.length > 0) {
+    // Still held by the other hand: re-capture so control passes smoothly.
     captureOffset(state);
   }
+  else {
+    // Fully released: become solid again.
+    state.entity.collidable.set(true);
 
-  // When the last hand lets go we stop driving velocity. The velocity set on the
-  // last frame remains on the physics body, so the object keeps the grab frame's
-  // motion -> it is thrown.
+    if (state.snapEnabled && state.snapGrid > 0) {
+      snapToGrid(state);
+    }
+  }
 
   state.options.onRelease?.(hand);
+}
+
+function snapToGrid(state: GrabbableState): void {
+  const g = state.snapGrid;
+  const p = state.entity.pos;
+
+  state.entity.pos = new Vector3(
+    Math.round(p.x / g) * g,
+    Math.round(p.y / g) * g,
+    Math.round(p.z / g) * g,
+  );
+  state.entity.rot = Quaternion.one;          // axis-align
+  state.entity.velocity.set(Vector3.zero);    // place neatly (no throw)
 }
 
 
@@ -363,34 +368,63 @@ function onPhysicsUpdate(deltaTime: number) {
     return;
   }
 
+  const bodyPos = Player.body.position.get();
+
   grabbables.forEach((state) => {
-    if (state.heldBy.length === 0) {
-      return;
-    }
-
-    // The held entity may have been destroyed elsewhere.
     if (!state.entity.exists()) {
-      state.heldBy.forEach((hand) => handHeld.set(hand, undefined));
-      state.heldBy = [];
+      if (state.heldBy.length > 0) {
+        state.heldBy.forEach((hand) => handHeld.set(hand, undefined));
+        state.heldBy = [];
+      }
       return;
     }
 
-    const frame = getGrabFrame(state);
+    // Held: drive the object to follow the grab frame (it is ghosted already).
+    if (state.heldBy.length > 0) {
+      const frame = getGrabFrame(state);
 
-    if (!frame) {
+      if (!frame) {
+        return;
+      }
+
+      const targetPos = frame.origin.add(frame.rot.rotateVector(state.localPosOffset));
+      const targetRot = frame.rot.multiply(state.localRotOffset);
+
+      const requiredVel = targetPos.subtract(state.entity.pos).divide(deltaTime);
+      state.entity.velocity.set(requiredVel);
+      state.entity.rot = targetRot;
       return;
     }
 
-    const targetPos = frame.origin.add(frame.rot.rotateVector(state.localPosOffset));
-    const targetRot = frame.rot.multiply(state.localRotOffset);
-
-    // Velocity-based move: reach the target this frame. As the grab frame moves,
-    // the required velocity tracks its motion, which is what we want left over on
-    // release (for throwing).
-    const requiredVel = targetPos.subtract(state.entity.pos).divide(deltaTime);
-    state.entity.velocity.set(requiredVel);
-
-    // No angular-velocity API is exposed, so match the target rotation directly.
-    state.entity.rot = targetRot;
+    // Not held: shield the player from being launched by this object.
+    if (bodyPos) {
+      applyPlayerShield(state, bodyPos);
+    }
   });
+}
+
+function applyPlayerShield(state: GrabbableState, bodyPos: Vector3): void {
+  const surfaceDist = boxSurfaceDistance(state.entity.pos, state.entity.rot, halfExtentsOf(state), bodyPos);
+
+  if (surfaceDist < playerBodyReach) {
+    // Player body is touching/inside the object: phase it out and hold it still
+    // so it neither launches the player nor falls while non-collidable.
+    if (!state.shielded) {
+      state.shielded = true;
+      state.shieldPose = { pos: state.entity.pos.clone(), rot: state.entity.rot.clone() };
+      state.entity.collidable.set(false);
+    }
+
+    if (state.shieldPose) {
+      state.entity.pos = state.shieldPose.pos;
+      state.entity.rot = state.shieldPose.rot;
+      state.entity.velocity.set(Vector3.zero);
+    }
+  }
+  else if (state.shielded) {
+    // Player moved away: make it solid again.
+    state.shielded = false;
+    state.shieldPose = undefined;
+    state.entity.collidable.set(true);
+  }
 }
