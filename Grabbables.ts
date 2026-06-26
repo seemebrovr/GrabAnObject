@@ -25,7 +25,7 @@ const tableCenter = new Vector3(0, 0, -0.6); // on the ground, 0.6m in front of 
 const topThickness = 0.05;
 const topWidth = 0.8;   // along X
 const topDepth = 0.5;   // along Z
-const legHeight = 0.7;  // along Y
+const legHeight = 0.95; // along Y (taller table)
 const legThickness = 0.05;
 
 // Height of the tabletop's upper surface (used to rest the cube on it).

@@ -9,19 +9,29 @@ import { registerStart } from "./RegisterStart";
 
 // Proximity grab with preserved offset and throw-on-release.
 //
-// While held, the object's velocity is driven each physics frame so it tracks the hand
-// (this overrides gravity). On release we simply stop driving it, so the velocity from
-// the last frame remains and the object is thrown with the hand's motion.
+// Supports one- OR two-handed holding:
+//   - One hand:  the object tracks that hand's position AND rotation, keeping
+//                whatever offset it had when grabbed.
+//   - Two hands: the object tracks the midpoint between the two hands. Its
+//                orientation is held fixed (no two-handed rotation) - moving the
+//                hands slides it around, but does not turn it.
 //
-// The grabbed entity must be of type 'Physics' for velocity (and therefore throwing) to work.
+// Grabbing with a second hand, or releasing one of two hands, re-captures the
+// offset so control passes smoothly without the object snapping.
+//
+// While held, the object's velocity is driven each physics frame so it tracks the
+// grab frame (this overrides gravity). On full release we stop driving it, so the
+// velocity from the last frame remains and the object is thrown with that motion.
+//
+// The grabbed entity must be of type 'Physics' for velocity (and throwing) to work.
 
 
 type Hand = 'Left' | 'Right';
 
 export type GrabbableOptions = {
-  /** Called when a hand grabs this entity */
+  /** Called when a hand grabs this entity (fires for each hand) */
   onGrab?: (hand: Hand) => void,
-  /** Called when a hand releases this entity */
+  /** Called when a hand releases this entity (fires for each hand) */
   onRelease?: (hand: Hand) => void,
 }
 
@@ -29,15 +39,15 @@ type GrabbableState = {
   entity: Entity,
   grabRadius: number,
   options: GrabbableOptions,
-  heldBy: Hand | undefined,
-  localPosOffset: Vector3,    // object position relative to the hand, in hand-local space, at grab time
-  localRotOffset: Quaternion, // object rotation relative to the hand rotation at grab time
+  heldBy: Hand[],             // hands currently holding this: 0, 1, or 2
+  localPosOffset: Vector3,    // object position relative to the grab frame, in frame-local space
+  localRotOffset: Quaternion, // object rotation relative to the grab frame
 }
 
 
 const grabbables = new Map<Entity, GrabbableState>();
 
-// Each hand can hold at most one grabbable
+// Each hand can hold at most one grabbable.
 const handHeld = new Map<Hand, GrabbableState | undefined>([
   ['Left', undefined],
   ['Right', undefined],
@@ -54,6 +64,7 @@ export const grabbable = {
 
 /**
  * Register an entity so it can be grabbed when a hand is within range and the grip is squeezed.
+ * Can be grabbed by either hand, or both hands at once.
  * @param entity the entity to make grabbable (should be a 'Physics' entity so it can be thrown)
  * @param grabRadius how close (in meters) a hand must be to grab it, defaults to 0.2
  * @param options optional onGrab / onRelease callbacks
@@ -67,30 +78,32 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     entity: entity,
     grabRadius: grabRadius,
     options: options,
-    heldBy: undefined,
+    heldBy: [],
     localPosOffset: Vector3.zero,
     localRotOffset: Quaternion.one,
   });
 }
 
 /**
- * Remove an entity from the grabbable system (releasing it first if currently held)
+ * Remove an entity from the grabbable system (releasing it from any hands first)
  */
 function remove(entity: Entity): void {
   const state = grabbables.get(entity);
 
-  if (state && state.heldBy) {
-    release(state.heldBy);
+  if (state) {
+    [...state.heldBy].forEach((hand) => release(hand));
   }
 
   grabbables.delete(entity);
 }
 
 /**
- * @returns true if the entity is currently being held by a hand
+ * @returns true if the entity is currently being held by at least one hand
  */
 function isHeld(entity: Entity): boolean {
-  return grabbables.get(entity)?.heldBy !== undefined;
+  const state = grabbables.get(entity);
+
+  return state !== undefined && state.heldBy.length > 0;
 }
 
 /**
@@ -111,24 +124,77 @@ function getHandRot(hand: Hand): Quaternion | undefined {
 }
 
 
+/**
+ * The "grab frame" is the moving reference the held object is locked to:
+ *   - one hand:  origin = hand position, rot = hand rotation
+ *   - two hands: origin = midpoint of the hands, rot = identity (a non-rotating
+ *                frame, so the object keeps a fixed orientation)
+ * Returns undefined if a required hand transform isn't available this frame.
+ */
+function getGrabFrame(state: GrabbableState): { origin: Vector3, rot: Quaternion } | undefined {
+  if (state.heldBy.length === 1) {
+    const pos = getHandPos(state.heldBy[0]);
+    const rot = getHandRot(state.heldBy[0]);
+
+    if (!pos || !rot) {
+      return undefined;
+    }
+
+    return { origin: pos, rot: rot };
+  }
+
+  if (state.heldBy.length >= 2) {
+    const posA = getHandPos(state.heldBy[0]);
+    const posB = getHandPos(state.heldBy[1]);
+
+    if (!posA || !posB) {
+      return undefined;
+    }
+
+    // Midpoint, with a fixed (identity) orientation -> position follows the hands,
+    // rotation stays put.
+    return { origin: posA.lerp(posB, 0.5), rot: Quaternion.one };
+  }
+
+  return undefined;
+}
+
+/**
+ * Capture the object's current offset from the current grab frame, so that
+ * changing which hands hold it doesn't make it jump.
+ */
+function captureOffset(state: GrabbableState): void {
+  const frame = getGrabFrame(state);
+
+  if (!frame) {
+    return;
+  }
+
+  const invFrameRot = frame.rot.inverse();
+
+  state.localPosOffset = invFrameRot.rotateVector(state.entity.pos.subtract(frame.origin));
+  state.localRotOffset = invFrameRot.multiply(state.entity.rot);
+}
+
+
 function tryGrab(hand: Hand): void {
   if (handHeld.get(hand)) {
     return; // this hand is already holding something
   }
 
   const handPos = getHandPos(hand);
-  const handRot = getHandRot(hand);
 
-  if (!handPos || !handRot) {
+  if (!handPos) {
     return;
   }
 
-  // Find the nearest un-held grabbable within its grab radius
+  // Find the nearest grabbable within range that this hand isn't already holding.
+  // An object held by the OTHER hand is allowed -> that becomes a two-handed grab.
   let nearest: GrabbableState | undefined;
   let nearestDist = Infinity;
 
   grabbables.forEach((state) => {
-    if (state.heldBy || !state.entity.exists()) {
+    if (state.heldBy.includes(hand) || !state.entity.exists()) {
       return;
     }
 
@@ -144,15 +210,11 @@ function tryGrab(hand: Hand): void {
     return;
   }
 
-  // Capture the object's current offset from the hand, expressed in the hand's local space,
-  // so the object keeps its relative position and orientation while held.
-  const invHandRot = handRot.inverse();
-
-  nearest.localPosOffset = invHandRot.rotateVector(nearest.entity.pos.subtract(handPos));
-  nearest.localRotOffset = invHandRot.multiply(nearest.entity.rot);
-  nearest.heldBy = hand;
-
+  nearest.heldBy.push(hand);
   handHeld.set(hand, nearest);
+
+  // Re-capture against the new grab frame (now possibly two-handed).
+  captureOffset(nearest);
 
   nearest.options.onGrab?.(hand);
 }
@@ -164,11 +226,18 @@ function release(hand: Hand): void {
     return;
   }
 
-  state.heldBy = undefined;
+  state.heldBy = state.heldBy.filter((h) => h !== hand);
   handHeld.set(hand, undefined);
 
-  // We stop overriding velocity here. The velocity set on the last frame remains on the
-  // physics body, so the object continues moving along the hand's motion -> it is thrown.
+  // If another hand is still holding it, re-capture against the new (single-hand)
+  // frame so control passes smoothly instead of snapping.
+  if (state.heldBy.length > 0) {
+    captureOffset(state);
+  }
+
+  // When the last hand lets go we stop driving velocity. The velocity set on the
+  // last frame remains on the physics body, so the object keeps the grab frame's
+  // motion -> it is thrown.
 
   state.options.onRelease?.(hand);
 }
@@ -189,33 +258,34 @@ function onPhysicsUpdate(deltaTime: number) {
     return;
   }
 
-  handHeld.forEach((state, hand) => {
-    if (!state) {
+  grabbables.forEach((state) => {
+    if (state.heldBy.length === 0) {
       return;
     }
 
-    // The held entity may have been destroyed elsewhere
+    // The held entity may have been destroyed elsewhere.
     if (!state.entity.exists()) {
-      handHeld.set(hand, undefined);
+      state.heldBy.forEach((hand) => handHeld.set(hand, undefined));
+      state.heldBy = [];
       return;
     }
 
-    const handPos = getHandPos(hand);
-    const handRot = getHandRot(hand);
+    const frame = getGrabFrame(state);
 
-    if (!handPos || !handRot) {
+    if (!frame) {
       return;
     }
 
-    const targetPos = handPos.add(handRot.rotateVector(state.localPosOffset));
-    const targetRot = handRot.multiply(state.localRotOffset);
+    const targetPos = frame.origin.add(frame.rot.rotateVector(state.localPosOffset));
+    const targetRot = frame.rot.multiply(state.localRotOffset);
 
-    // Velocity-based move: reach the target this frame. As the hand moves, the required
-    // velocity tracks the hand's velocity, which is exactly what we want left over on release.
+    // Velocity-based move: reach the target this frame. As the grab frame moves,
+    // the required velocity tracks its motion, which is what we want left over on
+    // release (for throwing).
     const requiredVel = targetPos.subtract(state.entity.pos).divide(deltaTime);
     state.entity.velocity.set(requiredVel);
 
-    // No angular-velocity API is exposed, so match the hand's rotation directly.
+    // No angular-velocity API is exposed, so match the target rotation directly.
     state.entity.rot = targetRot;
   });
 }
