@@ -122,6 +122,50 @@ export class Quaternion {
   }
 
   /**
+   * Returns the conjugate (negated vector part). For a unit (rotation) quaternion this equals the inverse.
+   */
+  conjugate(): Quaternion {
+    return new Quaternion(-this.x, -this.y, -this.z, this.w);
+  }
+
+  /**
+   * Returns the inverse rotation. Applying a rotation and then its inverse results in no rotation.
+   */
+  inverse(): Quaternion {
+    const lenSq = this.x * this.x + this.y * this.y + this.z * this.z + this.w * this.w;
+
+    if (lenSq < quaternionEpsilon) {
+      return Quaternion.one;
+    }
+
+    const inv = 1 / lenSq;
+
+    return new Quaternion(-this.x * inv, -this.y * inv, -this.z * inv, this.w * inv);
+  }
+
+  /**
+   * Rotates a Vector3 by this quaternion
+   * @param vec3 the vector to rotate
+   * @returns a new rotated Vector3
+   */
+  rotateVector(vec3: Vector3): Vector3 {
+    // v' = v + 2 * cross(q.xyz, cross(q.xyz, v) + q.w * v)
+    const tx = 2 * (this.y * vec3.z - this.z * vec3.y);
+    const ty = 2 * (this.z * vec3.x - this.x * vec3.z);
+    const tz = 2 * (this.x * vec3.y - this.y * vec3.x);
+
+    return new Vector3(
+      vec3.x + this.w * tx + (this.y * tz - this.z * ty),
+      vec3.y + this.w * ty + (this.z * tx - this.x * tz),
+      vec3.z + this.w * tz + (this.x * ty - this.y * tx)
+    );
+  }
+
+  static conjugate(q: Quaternion): Quaternion { return q.conjugate(); }
+  static inverse(q: Quaternion): Quaternion { return q.inverse(); }
+  static rotateVector(q: Quaternion, vec3: Vector3): Vector3 { return q.rotateVector(vec3); }
+
+  /**
    * Calculates the forward and calls Quaternion.lookAt
    * @param from pos to look from
    * @param to look at
