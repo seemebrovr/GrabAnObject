@@ -14,17 +14,18 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
 
 // ============================================================================
-// Grabbables - first project scene.
-// A table you can build on. Press the left X button for the Shapes menu and pull
-// a cube / sphere / cone straight into your hand. Each spawned shape can be
-// grabbed (anywhere on its surface), two-handed held, resized (select + drag a
-// handle), snapped to a grid, duplicated, and toggled (Physics / Snap / Collide)
-// from its property panel (thumbstick while holding). Shapes spawn with physics
-// OFF so they stay where you place them.
+// Grabbables - first project scene (a little building toy).
+// Press the left X button for the Shapes menu and pull a shape into your hand.
+// Each shape can be grabbed anywhere on its surface, held two-handed (spread your
+// hands to stretch it), resized with the select-and-drag handles, snapped to a
+// grid, duplicated, and toggled (Physics / Snap / Collide) from its property
+// panel (thumbstick while holding). Shapes spawn with physics OFF so they stay.
 // ============================================================================
 
 
-type Shape = 'Cube' | 'Sphere' | 'Cone';
+// Mesh shape used by spawnGrabbableShape. Slab/Pillar are just 'Cube' meshes with
+// non-cube default scales (chosen in the menu items below).
+type Shape = 'Cube' | 'Sphere' | 'Cone' | 'Pyramid';
 
 const tableTopColor = new Color(0.45, 0.30, 0.18);
 const tableLegColor = new Color(0.35, 0.23, 0.13);
@@ -41,11 +42,20 @@ const tableSurfaceY = tableCenter.y + legHeight + topThickness;
 const cubeSize = 0.2;
 const grabReach = 0.07;
 
+// Shape colors.
 const shapeRed = new Color(0.85, 0.18, 0.18);
 const shapeGreen = new Color(0.2, 0.7, 0.25);
 const shapeBlue = new Color(0.2, 0.45, 1);
+const shapeYellow = new Color(0.9, 0.8, 0.2);
+const shapePurple = new Color(0.6, 0.3, 0.85);
+const shapeOrange = new Color(0.95, 0.55, 0.15);
 
-// Remember which shape each spawned entity is, so Duplicate recreates the same one.
+// Default spawn sizes.
+const sizeUniform = new Vector3(cubeSize, cubeSize, cubeSize);
+const sizeSlab = new Vector3(0.3, 0.06, 0.3);
+const sizePillar = new Vector3(0.08, 0.4, 0.08);
+
+// Remember which mesh shape each spawned entity is, so Duplicate recreates it.
 const entityShape = new Map<Entity, Shape>();
 
 
@@ -57,13 +67,7 @@ function start() {
   makeTable();
 
   // Starting cube resting on the table.
-  spawnGrabbableShape(
-    'Cube',
-    new Vector3(tableCenter.x, tableSurfaceY + (cubeSize / 2), tableCenter.z),
-    new Vector3(cubeSize, cubeSize, cubeSize),
-    Quaternion.one,
-    shapeRed
-  );
+  spawnGrabbableShape('Cube', new Vector3(tableCenter.x, tableSurfaceY + (cubeSize / 2), tableCenter.z), sizeUniform, Quaternion.one, shapeRed);
 
   // While holding a shape, click that hand's thumbstick to open/close its panel.
   const togglePanel = (hand: Hand) => {
@@ -84,12 +88,14 @@ function start() {
   Controller.subscribe('leftThumbstick', 'Pressed', () => togglePanel('Left'));
   Controller.subscribe('rightThumbstick', 'Pressed', () => togglePanel('Right'));
 
-  // Shapes menu: press the left X button to open the palette, then click a shape
-  // to spawn it straight into the hand you clicked with.
+  // Shapes menu (left X button). Each item spawns into the hand that clicks it.
   spawnMenu.configure('Shapes', [
-    { label: 'Cube', color: shapeRed, icon: (b) => addShapeIcon('Cube', b, shapeRed), onSpawn: (hand) => spawnIntoHand(hand, 'Cube', shapeRed) },
-    { label: 'Sphere', color: shapeGreen, icon: (b) => addShapeIcon('Sphere', b, shapeGreen), onSpawn: (hand) => spawnIntoHand(hand, 'Sphere', shapeGreen) },
-    { label: 'Cone', color: shapeBlue, icon: (b) => addShapeIcon('Cone', b, shapeBlue), onSpawn: (hand) => spawnIntoHand(hand, 'Cone', shapeBlue) },
+    { label: 'Cube', color: shapeRed, icon: (b) => addShapeIcon('Cube', b, shapeRed, sizeUniform), onSpawn: (hand) => spawnIntoHand(hand, 'Cube', sizeUniform, shapeRed) },
+    { label: 'Sphere', color: shapeGreen, icon: (b) => addShapeIcon('Sphere', b, shapeGreen, sizeUniform), onSpawn: (hand) => spawnIntoHand(hand, 'Sphere', sizeUniform, shapeGreen) },
+    { label: 'Cone', color: shapeBlue, icon: (b) => addShapeIcon('Cone', b, shapeBlue, sizeUniform), onSpawn: (hand) => spawnIntoHand(hand, 'Cone', sizeUniform, shapeBlue) },
+    { label: 'Pyramid', color: shapeYellow, icon: (b) => addShapeIcon('Pyramid', b, shapeYellow, sizeUniform), onSpawn: (hand) => spawnIntoHand(hand, 'Pyramid', sizeUniform, shapeYellow) },
+    { label: 'Slab', color: shapePurple, icon: (b) => addShapeIcon('Cube', b, shapePurple, sizeSlab), onSpawn: (hand) => spawnIntoHand(hand, 'Cube', sizeSlab, shapePurple) },
+    { label: 'Pillar', color: shapeOrange, icon: (b) => addShapeIcon('Cube', b, shapeOrange, sizePillar), onSpawn: (hand) => spawnIntoHand(hand, 'Cube', sizePillar, shapeOrange) },
   ]);
 
   console.log('Grabbables ready: press the left X button for the Shapes menu.');
@@ -109,11 +115,14 @@ function spawnGrabbableShape(shape: Shape, pos: Vector3, scale: Vector3, rot: Qu
   else if (shape === 'Cone') {
     entity = spawnPrimitive.cone(16, pos, 1, rot, color, 1, 'Convex', 'Physics', undefined);
   }
+  else if (shape === 'Pyramid') {
+    entity = spawnPrimitive.cone(4, pos, 1, rot, color, 1, 'Convex', 'Physics', undefined); // a 4-sided cone
+  }
   else {
     entity = spawnPrimitive.cube(pos, Vector3.one, rot, color, 1, true, 'Physics', undefined);
   }
 
-  entity.scale = scale; // spheres/cones are built at size 1, then scaled to match
+  entity.scale = scale; // round shapes are built at size 1, then scaled to match
   entityShape.set(entity, shape);
 
   grabbable.make(entity, grabReach, {
@@ -149,30 +158,41 @@ function duplicateShape(target: Entity): void {
 
 
 /** Spawn a shape straight into the given hand (used by the Shapes menu). */
-function spawnIntoHand(hand: Hand, shape: Shape, color: Color): void {
+function spawnIntoHand(hand: Hand, shape: Shape, scale: Vector3, color: Color): void {
   const handPos = (hand === 'Left'
     ? Player.leftHand.position.get()
     : Player.rightHand.position.get()) ?? new Vector3(0, 1.4, -0.4);
 
-  const entity = spawnGrabbableShape(shape, handPos, new Vector3(cubeSize, cubeSize, cubeSize), Quaternion.one, color);
+  const entity = spawnGrabbableShape(shape, handPos, scale, Quaternion.one, color);
 
   grabbable.forceGrab(entity, hand);
 }
 
 
-/** A small, non-colliding 3D shape used as the icon on a Shapes-menu button. */
-function addShapeIcon(shape: Shape, button: Entity, color: Color): void {
-  const at = new Vector3(0, 0.022, 0.012);
-  const size = 0.05;
+/**
+ * A small, non-colliding 3D shape used as the icon on a Shapes-menu button. For
+ * box shapes the icon takes the proportions of `scaleHint` (so a Slab icon is
+ * flat, a Pillar icon is tall).
+ */
+function addShapeIcon(shape: Shape, button: Entity, color: Color, scaleHint: Vector3): void {
+  const at = new Vector3(0, 0.018, 0.012);
+  const iconMax = 0.055;
 
   if (shape === 'Sphere') {
-    spawnPrimitive.sphere(12, 8, at, size, Quaternion.one, color, 1, 'None', 'Empty', button);
+    spawnPrimitive.sphere(12, 8, at, iconMax, Quaternion.one, color, 1, 'None', 'Empty', button);
   }
   else if (shape === 'Cone') {
-    spawnPrimitive.cone(12, at, size, Quaternion.fromEuler(new Vector3(0.35, 0, 0)), color, 1, 'None', 'Empty', button);
+    spawnPrimitive.cone(12, at, iconMax, Quaternion.fromEuler(new Vector3(0.3, 0, 0)), color, 1, 'None', 'Empty', button);
+  }
+  else if (shape === 'Pyramid') {
+    spawnPrimitive.cone(4, at, iconMax, Quaternion.fromEuler(new Vector3(0.3, 0.5, 0)), color, 1, 'None', 'Empty', button);
   }
   else {
-    spawnPrimitive.cube(at, new Vector3(size, size, size), Quaternion.fromEuler(new Vector3(0.5, 0.6, 0)), color, 1, false, 'Empty', button);
+    const m = Math.max(scaleHint.x, scaleHint.y, scaleHint.z);
+    const f = iconMax / m;
+    const iconScale = new Vector3(scaleHint.x * f, scaleHint.y * f, scaleHint.z * f);
+
+    spawnPrimitive.cube(at, iconScale, Quaternion.fromEuler(new Vector3(0.45, 0.6, 0)), color, 1, false, 'Empty', button);
   }
 }
 

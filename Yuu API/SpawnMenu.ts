@@ -13,12 +13,10 @@ import { spawnPrimitive } from "./SpawnPrimitive";
 // ============================================================================
 // SpawnMenu - a palette that pops up in front of the player (left X button).
 // ----------------------------------------------------------------------------
-// Each item gets a button with an optional 3D icon and a text label. Point a
-// hand at a button and pull the trigger to activate it; the action is told WHICH
-// hand clicked (so the project can spawn the object into that hand).
-//
-// We do our own per-hand raycast on trigger because the shared ray-click
-// callback doesn't say which hand clicked.
+// Buttons are laid out in a grid below the title. Each button can have a small
+// 3D icon and a text label. Point a hand at a button and pull the trigger to
+// activate it; the action is told WHICH hand clicked (we do our own per-hand
+// raycast because the shared ray-click callback doesn't report the hand).
 // ============================================================================
 
 
@@ -40,12 +38,16 @@ export const spawnMenu = {
 }
 
 
-let menuTitle = 'Spawn';
+let menuTitle = 'Menu';
 let items: SpawnMenuItem[] = [];
 let menuRoot: Entity | undefined;
 let buttons: { entity: Entity, item: SpawnMenuItem }[] = [];
 
 const buttonBg = new Color(0.22, 0.22, 0.26);
+const perRow = 3;
+const colSpacing = 0.165;
+const rowSpacing = 0.17;
+const buttonSize = 0.14;
 
 
 /** Set the menu title and the list of things it can spawn. */
@@ -92,14 +94,20 @@ function open(): void {
     fz /= len;
   }
 
-  const center = new Vector3(headPos.x + (fx * 0.9), headPos.y - 0.05, headPos.z + (fz * 0.9));
+  const cols = Math.min(items.length, perRow);
+  const rows = Math.max(1, Math.ceil(items.length / perRow));
+
+  const panelW = (cols * colSpacing) + 0.07;
+  const panelH = (rows * rowSpacing) + 0.20; // grid + room for the title
+
+  const center = new Vector3(headPos.x + (fx * 0.9), headPos.y - 0.02, headPos.z + (fz * 0.9));
   const yaw = Math.atan2(-fx, -fz); // face back toward the player
   const rot = Quaternion.fromEuler(new Vector3(0, yaw, 0));
 
   menuRoot = spawnPrimitive.plane(
     'Front',
     center,
-    new Vector3(0.5, 0.34, 1),
+    new Vector3(panelW, panelH, 1),
     rot,
     new Color(0.12, 0.12, 0.14),
     1,
@@ -108,18 +116,22 @@ function open(): void {
     undefined
   );
 
-  addLabel(menuRoot, new Vector3(0, 0.12, 0.002), menuTitle, 5, Color.white);
+  // Title, clearly separated at the top.
+  const titleY = (panelH / 2) - 0.055;
+  addLabel(menuRoot, new Vector3(0, titleY, 0.002), menuTitle, 5, Color.white);
 
-  // Lay the item buttons out in a row.
-  const count = items.length;
-  const spacing = 0.15;
-  const startX = -((count - 1) * spacing) / 2;
+  // Grid of buttons below the title.
+  const startX = -((cols - 1) * colSpacing) / 2;
+  const firstRowY = titleY - 0.115;
 
   items.forEach((item, i) => {
+    const col = i % perRow;
+    const row = Math.floor(i / perRow);
+
     const button = spawnPrimitive.plane(
       'Front',
-      new Vector3(startX + (i * spacing), -0.02, 0.0025),
-      new Vector3(0.13, 0.15, 1),
+      new Vector3(startX + (col * colSpacing), firstRowY - (row * rowSpacing), 0.0025),
+      new Vector3(buttonSize, buttonSize, 1),
       Quaternion.one,
       buttonBg,
       1,
@@ -131,7 +143,7 @@ function open(): void {
     button.rayClick.initialize(false); // shows the pointer ray; action handled below
 
     if (item.icon) {
-      item.icon(button); // a small 3D shape sits on the button (no collider)
+      item.icon(button); // small 3D shape sits on the button (no collider)
     }
 
     const label = new Entity(new Vector3(0, -0.05, 0.004), Quaternion.one, Vector3.one, button, 'Static');

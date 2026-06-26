@@ -43,6 +43,8 @@ type GrabbableState = {
   snapGrid: number,
   snapEnabled: boolean,
   collidablePref: boolean,      // the user's chosen collidable state (restored after ghosting)
+  twoHandStartDist: number,     // hand separation when a two-handed grab began (for stretch)
+  twoHandStartScale: Vector3,   // object scale when a two-handed grab began
   heldBy: Hand[],
   localPosOffset: Vector3,
   localRotOffset: Quaternion,
@@ -94,6 +96,8 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     snapGrid: options.snapGrid ?? 0,
     snapEnabled: false,
     collidablePref: true,
+    twoHandStartDist: 0.05,
+    twoHandStartScale: Vector3.one,
     heldBy: [],
     localPosOffset: Vector3.zero,
     localRotOffset: Quaternion.one,
@@ -212,6 +216,7 @@ function forceGrab(entity: Entity, hand: Hand): void {
   }
 
   captureOffset(state);
+  captureTwoHandStart(state);
 
   state.options.onGrab?.(hand);
 }
@@ -263,6 +268,51 @@ function captureOffset(state: GrabbableState): void {
 
   state.localPosOffset = invFrameRot.rotateVector(state.entity.pos.subtract(frame.origin));
   state.localRotOffset = invFrameRot.multiply(state.entity.rot);
+}
+
+// Capture the hand separation and object scale when a two-handed grab begins,
+// so we can stretch the object by the change in hand distance.
+function captureTwoHandStart(state: GrabbableState): void {
+  if (state.heldBy.length !== 2) {
+    return;
+  }
+
+  const a = getHandPos(state.heldBy[0]);
+  const b = getHandPos(state.heldBy[1]);
+
+  if (a && b) {
+    state.twoHandStartDist = Math.max(a.distanceTo(b), 0.05);
+    state.twoHandStartScale = state.entity.scale;
+  }
+}
+
+// While held by two hands, scale the object by how much the hands have spread
+// since the grab began (uniform stretch). Keeps the grab box in sync.
+function applyTwoHandStretch(state: GrabbableState): void {
+  if (state.heldBy.length < 2) {
+    return;
+  }
+
+  const a = getHandPos(state.heldBy[0]);
+  const b = getHandPos(state.heldBy[1]);
+
+  if (!a || !b) {
+    return;
+  }
+
+  const factor = a.distanceTo(b) / state.twoHandStartDist;
+
+  const newScale = new Vector3(
+    Math.max(state.twoHandStartScale.x * factor, 0.02),
+    Math.max(state.twoHandStartScale.y * factor, 0.02),
+    Math.max(state.twoHandStartScale.z * factor, 0.02),
+  );
+
+  state.entity.scale = newScale;
+
+  if (state.grabBox) {
+    state.grabBox = new Vector3(newScale.x / 2, newScale.y / 2, newScale.z / 2);
+  }
 }
 
 
@@ -413,6 +463,7 @@ function tryGrab(hand: Hand): void {
   }
 
   captureOffset(nearest);
+  captureTwoHandStart(nearest);
 
   nearest.options.onGrab?.(hand);
 }
@@ -481,6 +532,8 @@ function onPhysicsUpdate(deltaTime: number) {
       const requiredVel = targetPos.subtract(state.entity.pos).divide(deltaTime);
       state.entity.velocity.set(requiredVel);
       state.entity.rot = targetRot;
+
+      applyTwoHandStretch(state);
       return;
     }
 
