@@ -4,6 +4,7 @@ import { Vector3 } from "./Basic Types/Vector3";
 import { Entity } from "./Entity";
 import { Events } from "./Events";
 import { grabbable } from "./Grabbable";
+import { Player } from "./Player";
 import { registerStart } from "./RegisterStart";
 import { spawnPrimitive } from "./SpawnPrimitive";
 
@@ -72,16 +73,36 @@ function setFrozenPose(entity: Entity, pos: Vector3, rot: Quaternion): void {
 }
 
 
+// A rotation that makes a panel placed at `pos` face the player (horizontal yaw).
+function facePlayer(pos: Vector3): Quaternion {
+  const head = Player.head.position.get();
+
+  if (!head) {
+    return Quaternion.one;
+  }
+
+  const dx = head.x - pos.x;
+  const dz = head.z - pos.z;
+  const len = Math.sqrt((dx * dx) + (dz * dz));
+
+  if (len < 0.0001) {
+    return Quaternion.one;
+  }
+
+  return Quaternion.fromEuler(new Vector3(0, Math.atan2(dx / len, dz / len), 0));
+}
+
 function open(target: Entity, options: OpenOptions = {}): void {
   close();
 
-  const anchor = target.pos.add(new Vector3(0, 0.4, 0.12));
+  const anchor = target.pos.add(new Vector3(0, 0.4, 0));
+  const facing = facePlayer(anchor);
 
   panelRoot = spawnPrimitive.plane(
     'Front',
     anchor,
     new Vector3(0.34, 0.44, 1),
-    Quaternion.one,
+    facing,
     new Color(0.12, 0.12, 0.14),
     1,
     'None',

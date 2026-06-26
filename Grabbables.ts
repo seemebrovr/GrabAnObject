@@ -14,23 +14,21 @@ import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
 
 // ============================================================================
-// Grabbables - first project scene
-// ----------------------------------------------------------------------------
-// A table with a grabbable cube on top. You can:
-//   - Grab a cube anywhere on its surface (squeeze grip) and throw it.
-//   - Select it (point + trigger) to show XYZ handles, then drag a face handle
-//     to resize that one side.
-//   - While holding it, click the thumbstick to open its property panel
-//     (Physics on/off, Duplicate).
-// (No floor, so anything that falls off the table keeps falling.)
+// Grabbables - first project scene.
+// A table you can build on. Press the left X button for the Shapes menu and pull
+// a cube / sphere / cone straight into your hand. Each spawned shape can be
+// grabbed (anywhere on its surface), two-handed held, resized (select + drag a
+// handle), snapped to a grid, duplicated, and toggled (Physics / Snap / Collide)
+// from its property panel (thumbstick while holding). Shapes spawn with physics
+// OFF so they stay where you place them.
 // ============================================================================
 
 
-// Wood-ish colors for the table.
+type Shape = 'Cube' | 'Sphere' | 'Cone';
+
 const tableTopColor = new Color(0.45, 0.30, 0.18);
 const tableLegColor = new Color(0.35, 0.23, 0.13);
 
-// Where the table stands and how big it is (meters).
 const tableCenter = new Vector3(0, 0, -0.6);
 const topThickness = 0.05;
 const topWidth = 0.8;
@@ -40,10 +38,15 @@ const legThickness = 0.05;
 
 const tableSurfaceY = tableCenter.y + legHeight + topThickness;
 
-// The starting cube.
-const cubeSize = 0.2;     // 20cm cube
-const grabReach = 0.07;   // how close (m) a hand must be to a cube's surface to grab it
-const cubeBlue = new Color(0.2, 0.45, 1);
+const cubeSize = 0.2;
+const grabReach = 0.07;
+
+const shapeRed = new Color(0.85, 0.18, 0.18);
+const shapeGreen = new Color(0.2, 0.7, 0.25);
+const shapeBlue = new Color(0.2, 0.45, 1);
+
+// Remember which shape each spawned entity is, so Duplicate recreates the same one.
+const entityShape = new Map<Entity, Shape>();
 
 
 registerStart(start);
@@ -54,98 +57,123 @@ function start() {
   makeTable();
 
   // Starting cube resting on the table.
-  spawnGrabbableCube(
+  spawnGrabbableShape(
+    'Cube',
     new Vector3(tableCenter.x, tableSurfaceY + (cubeSize / 2), tableCenter.z),
     new Vector3(cubeSize, cubeSize, cubeSize),
     Quaternion.one,
-    Color.red
+    shapeRed
   );
 
-  // While holding a cube, click that hand's thumbstick to open/close its panel.
+  // While holding a shape, click that hand's thumbstick to open/close its panel.
   const togglePanel = (hand: Hand) => {
     const held = grabbable.heldEntity(hand);
 
     if (!held) {
-      return; // this hand isn't holding anything
+      return;
     }
 
     if (propertyPanel.isOpen()) {
       propertyPanel.close();
     }
     else {
-      propertyPanel.open(held, { onDuplicate: duplicateCube });
+      propertyPanel.open(held, { onDuplicate: duplicateShape });
     }
   };
 
   Controller.subscribe('leftThumbstick', 'Pressed', () => togglePanel('Left'));
   Controller.subscribe('rightThumbstick', 'Pressed', () => togglePanel('Right'));
 
-  // Spawn menu: press the left X button to open a palette in front of you, then
-  // click a color to spawn that cube straight into the hand you clicked with.
-  spawnMenu.configure([
-    { label: 'Red', color: Color.red, onSpawn: (hand) => spawnIntoHand(hand, Color.red) },
-    { label: 'Green', color: Color.green, onSpawn: (hand) => spawnIntoHand(hand, Color.green) },
-    { label: 'Blue', color: cubeBlue, onSpawn: (hand) => spawnIntoHand(hand, cubeBlue) },
+  // Shapes menu: press the left X button to open the palette, then click a shape
+  // to spawn it straight into the hand you clicked with.
+  spawnMenu.configure('Shapes', [
+    { label: 'Cube', color: shapeRed, icon: (b) => addShapeIcon('Cube', b, shapeRed), onSpawn: (hand) => spawnIntoHand(hand, 'Cube', shapeRed) },
+    { label: 'Sphere', color: shapeGreen, icon: (b) => addShapeIcon('Sphere', b, shapeGreen), onSpawn: (hand) => spawnIntoHand(hand, 'Sphere', shapeGreen) },
+    { label: 'Cone', color: shapeBlue, icon: (b) => addShapeIcon('Cone', b, shapeBlue), onSpawn: (hand) => spawnIntoHand(hand, 'Cone', shapeBlue) },
   ]);
 
-  console.log('Grabbables ready: grab a cube by its surface and squeeze grip.');
+  console.log('Grabbables ready: press the left X button for the Shapes menu.');
 }
 
 
 /**
- * Spawn a red physics cube that can be grabbed (anywhere on its surface),
- * resized (select it, then drag a face handle), and duplicated (property panel).
+ * Create a grabbable, scalable, snappable physics shape. Physics starts OFF so it
+ * stays where you place it (toggle it on in the property panel).
  */
-function spawnGrabbableCube(pos: Vector3, scale: Vector3, rot: Quaternion, color: Color): Entity {
-  const cube = spawnPrimitive.cube(pos, scale, rot, color, 1, true, 'Physics', undefined);
+function spawnGrabbableShape(shape: Shape, pos: Vector3, scale: Vector3, rot: Quaternion, color: Color): Entity {
+  let entity: Entity;
 
-  // Grab anywhere within grabReach of the cube's surface.
-  grabbable.make(cube, grabReach, {
+  if (shape === 'Sphere') {
+    entity = spawnPrimitive.sphere(16, 12, pos, 1, rot, color, 1, 'Sphere', 'Physics', undefined);
+  }
+  else if (shape === 'Cone') {
+    entity = spawnPrimitive.cone(16, pos, 1, rot, color, 1, 'Convex', 'Physics', undefined);
+  }
+  else {
+    entity = spawnPrimitive.cube(pos, Vector3.one, rot, color, 1, true, 'Physics', undefined);
+  }
+
+  entity.scale = scale; // spheres/cones are built at size 1, then scaled to match
+  entityShape.set(entity, shape);
+
+  grabbable.make(entity, grabReach, {
     grabBox: new Vector3(scale.x / 2, scale.y / 2, scale.z / 2),
-    snapGrid: 0.1, // 10cm grid, used when Snap is turned on in the property panel
-    onGrab: (hand) => console.log(hand + ' hand grabbed a cube'),
-    onRelease: (hand) => console.log(hand + ' hand released a cube'),
+    snapGrid: 0.1,
+    onGrab: (hand) => console.log(hand + ' grabbed a ' + shape),
+    onRelease: (hand) => console.log(hand + ' released a ' + shape),
   });
 
-  // Resize handles; keep the grab box in sync as the cube is stretched.
-  scaleGizmo.attach(cube, {
-    onScale: (s) => grabbable.setGrabBox(cube, new Vector3(s.x / 2, s.y / 2, s.z / 2)),
+  scaleGizmo.attach(entity, {
+    onScale: (s) => grabbable.setGrabBox(entity, new Vector3(s.x / 2, s.y / 2, s.z / 2)),
   });
 
-  // Spawn with physics OFF so it stays where you place it (toggle it on in the panel).
-  propertyPanel.setPhysicsEnabled(cube, false);
+  propertyPanel.setPhysicsEnabled(entity, false);
 
-  return cube;
+  return entity;
 }
 
 
-/**
- * Duplicate: make another cube with the same size, rotation and color as the
- * target, placed just beside it.
- */
-function duplicateCube(target: Entity): void {
+/** Duplicate: same shape, size, rotation and color, placed beside the original. */
+function duplicateShape(target: Entity): void {
+  const shape = entityShape.get(target) ?? 'Cube';
   const scale = target.scale;
   const rot = target.rot;
 
   const colorInfo = target.mesh.color.get();
-  const color = colorInfo ? colorInfo.color : Color.red;
+  const color = colorInfo ? colorInfo.color : shapeRed;
 
-  // Offset along world X by the cube's width + a small gap, so it doesn't overlap.
   const pos = target.pos.add(new Vector3(scale.x + 0.1, 0, 0));
 
-  spawnGrabbableCube(pos, scale, rot, color);
+  spawnGrabbableShape(shape, pos, scale, rot, color);
 }
 
 
-// Spawn a cube and place it straight into the given hand (used by the spawn menu).
-function spawnIntoHand(hand: Hand, color: Color): void {
+/** Spawn a shape straight into the given hand (used by the Shapes menu). */
+function spawnIntoHand(hand: Hand, shape: Shape, color: Color): void {
   const handPos = (hand === 'Left'
     ? Player.leftHand.position.get()
     : Player.rightHand.position.get()) ?? new Vector3(0, 1.4, -0.4);
 
-  const cube = spawnGrabbableCube(handPos, new Vector3(cubeSize, cubeSize, cubeSize), Quaternion.one, color);
+  const entity = spawnGrabbableShape(shape, handPos, new Vector3(cubeSize, cubeSize, cubeSize), Quaternion.one, color);
 
-  grabbable.forceGrab(cube, hand);
+  grabbable.forceGrab(entity, hand);
+}
+
+
+/** A small, non-colliding 3D shape used as the icon on a Shapes-menu button. */
+function addShapeIcon(shape: Shape, button: Entity, color: Color): void {
+  const at = new Vector3(0, 0.022, 0.012);
+  const size = 0.05;
+
+  if (shape === 'Sphere') {
+    spawnPrimitive.sphere(12, 8, at, size, Quaternion.one, color, 1, 'None', 'Empty', button);
+  }
+  else if (shape === 'Cone') {
+    spawnPrimitive.cone(12, at, size, Quaternion.fromEuler(new Vector3(0.35, 0, 0)), color, 1, 'None', 'Empty', button);
+  }
+  else {
+    spawnPrimitive.cube(at, new Vector3(size, size, size), Quaternion.fromEuler(new Vector3(0.5, 0.6, 0)), color, 1, false, 'Empty', button);
+  }
 }
 
 
