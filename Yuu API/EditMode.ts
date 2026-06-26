@@ -28,8 +28,8 @@ const hands: Hand[] = ['Left', 'Right'];
 
 let active = false;
 
-// The rig position we drive while in edit mode.
-let editPos = Vector3.zero;
+// The rig position we drive toward while in edit mode (our target).
+let flyPos = Vector3.zero;
 
 // Button down-states.
 const gripDown: HandFlags = { Left: false, Right: false };
@@ -62,7 +62,7 @@ function setActive(value: boolean): void {
 
   if (active) {
     const p = Player.position.get();
-    editPos = p ? p.clone() : Vector3.zero;
+    flyPos = p ? p.clone() : Vector3.zero;
 
     wasWorldGripping.Left = false;
     wasWorldGripping.Right = false;
@@ -120,6 +120,15 @@ function onPhysicsUpdate(deltaTime: number): void {
     return;
   }
 
+  // Measure the hand against the rig's ACTUAL position (read fresh each frame),
+  // not against our target. This closes the feedback loop, so the movement can't
+  // run away even if the engine resists Player.position.set.
+  const rigPos = Player.position.get();
+
+  if (!rigPos) {
+    return;
+  }
+
   let move = Vector3.zero;
   let count = 0;
 
@@ -132,31 +141,34 @@ function onPhysicsUpdate(deltaTime: number): void {
       return;
     }
 
-    const hand_world = handPos(hand);
+    const handWorld = handPos(hand);
 
-    if (!hand_world) {
+    if (!handWorld) {
       wasWorldGripping[hand] = false;
       return;
     }
 
-    // The hand's physical offset from the rig (independent of where the rig is).
-    const handLocal = hand_world.subtract(editPos);
+    // Physical hand offset from the actual rig.
+    const offset = handWorld.subtract(rigPos);
 
     if (wasWorldGripping[hand]) {
-      // Move the rig opposite to the hand's motion, so the grabbed point in the
-      // world stays under the hand (you pull yourself along).
-      move = move.subtract(handLocal.subtract(lastHandLocal[hand]));
-      count++;
+      const delta = offset.subtract(lastHandLocal[hand]);
+
+      // Safety: ignore impossible single-frame jumps so nothing can fling you.
+      if (delta.magnitude() < 0.3) {
+        move = move.subtract(delta); // move opposite the hand's motion
+        count++;
+      }
     }
 
-    lastHandLocal[hand] = handLocal;
+    lastHandLocal[hand] = offset;
     wasWorldGripping[hand] = true;
   });
 
   if (count > 0) {
-    editPos = editPos.add(move.divide(count)); // average when both hands are pulling
+    flyPos = flyPos.add(move.divide(count)); // average when both hands are pulling
   }
 
-  // Drive the rig: holds you floating in place and applies any movement.
-  Player.position.set(editPos);
+  // Drive the rig toward our target (holds you floating + applies movement).
+  Player.position.set(flyPos);
 }

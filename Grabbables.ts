@@ -59,6 +59,9 @@ const sizePillar = new Vector3(0.08, 0.4, 0.08);
 // Remember which mesh shape each spawned entity is, so Duplicate recreates it.
 const entityShape = new Map<Entity, Shape>();
 
+// Where the player is placed when leaving edit mode (default spot at the table).
+const playerHome = new Vector3(0, 0, 0);
+
 
 registerStart(start);
 
@@ -93,8 +96,16 @@ function start() {
   Controller.subscribe('leftThumbstick', 'Pressed', () => togglePanel('Left'));
   Controller.subscribe('rightThumbstick', 'Pressed', () => togglePanel('Right'));
 
-  // Toggling edit mode (both thumbsticks) closes any open property panel.
-  editMode.onModeChange(() => propertyPanel.close());
+  // Toggling edit mode (both thumbsticks) closes any open property panel, and
+  // leaving edit mode drops the player back in front of the table (facing it).
+  editMode.onModeChange((isActive) => {
+    propertyPanel.close();
+
+    if (!isActive) {
+      Player.position.set(playerHome);
+      Player.rotation.set(Quaternion.one);
+    }
+  });
 
   // Shapes menu (left X button). Each item spawns into the hand that clicks it.
   spawnMenu.configure('Shapes', [
