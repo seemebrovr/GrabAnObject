@@ -2,7 +2,9 @@ import { Color } from "./Yuu API/Basic Types/Color";
 import { Quaternion } from "./Yuu API/Basic Types/Quaternion";
 import { Vector3 } from "./Yuu API/Basic Types/Vector3";
 import { inWorldConsole } from "./Yuu API/Console";
-import { grabbable } from "./Yuu API/Grabbable";
+import { Controller } from "./Yuu API/Controller";
+import { grabbable, Hand } from "./Yuu API/Grabbable";
+import { propertyPanel } from "./Yuu API/PropertyPanel";
 import { registerStart } from "./Yuu API/RegisterStart";
 import { spawnPrimitive } from "./Yuu API/SpawnPrimitive";
 
@@ -68,6 +70,25 @@ function start() {
     onGrab: (hand) => console.log(hand + ' hand grabbed the cube'),
     onRelease: (hand) => console.log(hand + ' hand released the cube'),
   });
+
+  // While holding the cube, click the holding hand's thumbstick to open/close the
+  // property panel. Operate the panel by pointing your OTHER hand at a button and
+  // pulling the trigger.
+  const togglePanel = (hand: Hand) => {
+    if (!grabbable.heldBy(cube).includes(hand)) {
+      return; // only the hand actually holding the cube opens the panel
+    }
+
+    if (propertyPanel.isOpen()) {
+      propertyPanel.close();
+    }
+    else {
+      propertyPanel.open(cube);
+    }
+  };
+
+  Controller.subscribe('leftThumbstick', 'Pressed', () => togglePanel('Left'));
+  Controller.subscribe('rightThumbstick', 'Pressed', () => togglePanel('Right'));
 
   console.log('Grabbables ready: pick the cube up off the table with grip.');
 }

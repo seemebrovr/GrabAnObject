@@ -26,7 +26,7 @@ import { registerStart } from "./RegisterStart";
 // The grabbed entity must be of type 'Physics' for velocity (and throwing) to work.
 
 
-type Hand = 'Left' | 'Right';
+export type Hand = 'Left' | 'Right';
 
 export type GrabbableOptions = {
   /** Called when a hand grabs this entity (fires for each hand) */
@@ -66,6 +66,7 @@ export const grabbable = {
   remove,
   isHeld,
   releaseAll,
+  heldBy,
 }
 
 
@@ -112,6 +113,15 @@ function isHeld(entity: Entity): boolean {
   const state = grabbables.get(entity);
 
   return state !== undefined && state.heldBy.length > 0;
+}
+
+/**
+ * @returns the hands currently holding the entity: [], ['Left'], ['Right'], or both
+ */
+function heldBy(entity: Entity): Hand[] {
+  const state = grabbables.get(entity);
+
+  return state ? [...state.heldBy] : [];
 }
 
 /**
