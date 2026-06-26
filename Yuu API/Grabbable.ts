@@ -284,6 +284,50 @@ function handGrabDistance(state: GrabbableState, handPos: Vector3): number {
 }
 
 
+// Axis-aligned (multiples of 90 degrees) candidate orientations, built once.
+let snapOrientationsCache: Quaternion[] | undefined;
+
+function snapOrientations(): Quaternion[] {
+  if (!snapOrientationsCache) {
+    const angles = [0, Math.PI / 2, Math.PI, (3 * Math.PI) / 2];
+    const list: Quaternion[] = [];
+
+    angles.forEach((x) => {
+      angles.forEach((y) => {
+        angles.forEach((z) => {
+          list.push(Quaternion.fromEuler(new Vector3(x, y, z)));
+        });
+      });
+    });
+
+    snapOrientationsCache = list;
+  }
+
+  return snapOrientationsCache;
+}
+
+// Snap a rotation to the nearest axis-aligned (90-degree) orientation, keeping
+// which way the object is turned (so a box placed along Z stays along Z).
+function snapRotation(q: Quaternion): Quaternion {
+  const candidates = snapOrientations();
+
+  let best = candidates[0];
+  let bestDot = -1;
+
+  candidates.forEach((c) => {
+    // |dot| because q and -q are the same rotation; nearest = largest |dot|.
+    const dot = Math.abs((q.x * c.x) + (q.y * c.y) + (q.z * c.z) + (q.w * c.w));
+
+    if (dot > bestDot) {
+      bestDot = dot;
+      best = c;
+    }
+  });
+
+  return best.clone();
+}
+
+
 function tryGrab(hand: Hand): void {
   if (handHeld.get(hand)) {
     return;
@@ -416,7 +460,7 @@ function onPhysicsUpdate(deltaTime: number) {
         Math.round(p.y / g) * g,
         Math.round(p.z / g) * g,
       );
-      state.entity.rot = Quaternion.one;
+      state.entity.rot = snapRotation(state.entity.rot);
       state.entity.velocity.set(Vector3.zero);
     }
   });
