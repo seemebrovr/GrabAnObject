@@ -10,12 +10,21 @@ import { spawnPrimitive } from "./SpawnPrimitive";
 
 
 // Proximity grab with preserved offset, throw-on-release, one/two-handed holding,
-// surface grabbing, grid snapping, collidable preference, a player-launch shield,
-// and a yellow proximity highlight.
+// surface grabbing, collidable preference, a player-launch shield, and a yellow
+// proximity highlight.
 //
-// By default the GRIP grabs. In edit mode the grip is needed for flying, so the
-// project can switch grabbing to the TRIGGER: setGripEnabled(false) stops grip
-// from grabbing, and grab()/release() can be driven from the trigger instead.
+// SNAPPING (Horizon-style upgrade): a snap-enabled held piece previews a ghost of
+// where it will land and hard-snaps on release. Built in numbered layers:
+//   1 type rules      - canSnap() compatibility table, filtered before scoring
+//   2 overlap reject   - candidate AABB tested against placed pieces
+//   3 hysteresis       - locked target sticks until a rival clearly wins
+//   4 local alignment  - flush math done in the neighbour's local frame (rotated ok)
+//   5 grid fallback     - open-space release quantises to snapGrid + 90 deg yaw
+//   6 feedback         - ghost blue(search)/green(valid)/red(blocked) + audio hook
+//   7 broadphase       - a uniform spatial hash feeds the candidate search
+//
+// By default the GRIP grabs; in edit mode grabbing is driven from the TRIGGER via
+// grab()/release() with setGripEnabled(false).
 
 
 export type Hand = 'Left' | 'Right';
@@ -26,6 +35,7 @@ export type GrabbableOptions = {
   grabPoints?: Vector3[],
   grabBox?: Vector3,
   snapGrid?: number,
+  snapCategory?: string, // [1] e.g. 'wall' | 'floor' | 'door' | 'prop'
 }
 
 type Pose = { pos: Vector3, rot: Quaternion };
@@ -38,6 +48,7 @@ type GrabbableState = {
   grabBox: Vector3 | undefined,
   snapGrid: number,
   snapEnabled: boolean,
+  snapCategory: string,                  // [1]
   collidablePref: boolean,
   twoHandStartDist: number,
   twoHandStartScale: Vector3,
@@ -49,6 +60,11 @@ type GrabbableState = {
   highlighted: boolean,
   snapGhost: Entity | undefined,
   pendingSnap: Pose | undefined,
+  snapTargetEntity: Entity | undefined,  // [3] currently locked snap neighbour
+  snapScore: number,                     // [3]
+  prevSnapValidTarget: Entity | undefined, // [6] for the "new lock" sound edge
+  hashKey: string | undefined,           // [7]
+  inHash: boolean,                       // [7]
 }
 
 
@@ -70,12 +86,30 @@ const highlightColor = new Color(1, 0.85, 0.1);
 const highlightStrength = 1.5;
 const highlightRange = 0.07; // metres from the surface (or inside) to start glowing
 
-// Object-to-object snapping. A held object previews a translucent "ghost" at the
-// flush pose against a nearby object's nearest face (edges/corners aligned on the
-// other two axes), then hard-snaps there on release.
-const maxSnapDistance = 0.2; // how far the object may move to reach a snap
-const ghostColor = new Color(0.3, 0.9, 1);
-const ghostAlpha = 0.3;
+
+// --- Snap tunables (edit these to change the feel) --------------------------
+const maxSnapDistance = 0.2;        // [base] max distance a piece may move to reach a neighbour snap
+const ghostAlpha = 0.3;             // [base] ghost translucency
+const ghostColorSearching = new Color(0.30, 0.60, 1.0);  // [6] blue: searching / grid fallback
+const ghostColorValid = new Color(0.20, 0.95, 0.45);     // [6] green: a valid snap is locked
+const ghostColorInvalid = new Color(0.95, 0.25, 0.25);   // [6] red: nearest slot is occupied / blocked
+const snapOverlapTolerance = 0.01;  // [2] slack so flush (touching) faces are not read as overlapping
+const snapHysteresis = 0.12;        // [3] a rival must beat the locked target's score by 12% to steal it
+const defaultSnapGrid = 0.1;        // [5] grid cell used when a piece has no snapGrid of its own
+const snapCellSize = 0.5;           // [7] spatial-hash cell size in metres (>= maxSnapDistance + piece size)
+
+// [1] Category compatibility table - the single place to edit what snaps to what.
+// canSnap() is symmetric: listing it in either direction is enough.
+const snapCompatibility: { [category: string]: string[] } = {
+  wall: ['wall', 'floor', 'door', 'window'],
+  floor: ['floor', 'wall', 'prop'],
+  door: ['wall'],
+  window: ['wall'],
+  prop: ['prop', 'floor'],
+};
+function canSnap(a: string, b: string): boolean {
+  return (snapCompatibility[a]?.includes(b) ?? false) || (snapCompatibility[b]?.includes(a) ?? false);
+}
 
 
 export const grabbable = {
@@ -89,6 +123,8 @@ export const grabbable = {
   setGrabBox,
   setSnapEnabled,
   getSnapEnabled,
+  setSnapCategory,
+  getSnapCategory,
   setCollidable,
   getCollidable,
   forceGrab,
@@ -103,12 +139,13 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     console.log('grabbable.make: entity should be a Physics entity for throw-on-release to work.');
   }
 
-  grabbables.set(entity, {
+  const state: GrabbableState = {
     entity, grabRadius, options,
     grabPoints: options.grabPoints ?? [],
     grabBox: options.grabBox,
     snapGrid: options.snapGrid ?? 0,
     snapEnabled: false,
+    snapCategory: options.snapCategory ?? 'prop',
     collidablePref: true,
     twoHandStartDist: 0.05,
     twoHandStartScale: Vector3.one,
@@ -120,12 +157,20 @@ function make(entity: Entity, grabRadius: number = 0.2, options: GrabbableOption
     highlighted: false,
     snapGhost: undefined,
     pendingSnap: undefined,
-  });
+    snapTargetEntity: undefined,
+    snapScore: Infinity,
+    prevSnapValidTarget: undefined,
+    hashKey: undefined,
+    inHash: false,
+  };
+
+  grabbables.set(entity, state);
+  hashInsert(state); // [7] index the freshly-placed piece
 }
 
 function remove(entity: Entity): void {
   const s = grabbables.get(entity);
-  if (s) { [...s.heldBy].forEach((h) => release(h)); destroyGhost(s); }
+  if (s) { [...s.heldBy].forEach((h) => release(h)); destroyGhost(s); hashRemove(s); }
   grabbables.delete(entity);
 }
 
@@ -144,6 +189,8 @@ function setGrabPoints(entity: Entity, points: Vector3[]): void { const s = grab
 function setGrabBox(entity: Entity, halfExtents: Vector3): void { const s = grabbables.get(entity); if (s) { s.grabBox = halfExtents; } }
 function setSnapEnabled(entity: Entity, enabled: boolean): void { const s = grabbables.get(entity); if (s) { s.snapEnabled = enabled; } }
 function getSnapEnabled(entity: Entity): boolean { return grabbables.get(entity)?.snapEnabled ?? false; }
+function setSnapCategory(entity: Entity, category: string): void { const s = grabbables.get(entity); if (s) { s.snapCategory = category; } }
+function getSnapCategory(entity: Entity): string { return grabbables.get(entity)?.snapCategory ?? 'prop'; }
 function setCollidable(entity: Entity, collidable: boolean): void { const s = grabbables.get(entity); if (s) { s.collidablePref = collidable; if (s.heldBy.length === 0 && !s.shielded) { entity.collidable.set(collidable); } } }
 function getCollidable(entity: Entity): boolean { return grabbables.get(entity)?.collidablePref ?? true; }
 
@@ -151,6 +198,15 @@ function getCollidable(entity: Entity): boolean { return grabbables.get(entity)?
 function setGripEnabled(enabled: boolean): void { gripEnabled = enabled; }
 
 function releaseAll(): void { release('Left'); release('Right'); }
+
+// Called when a piece leaves its resting state: drop it from the spatial hash and
+// clear any remembered snap target so the next hold starts fresh.
+function onGrabbed(s: GrabbableState): void {
+  hashRemove(s);
+  s.snapTargetEntity = undefined;
+  s.snapScore = Infinity;
+  s.prevSnapValidTarget = undefined;
+}
 
 function forceGrab(entity: Entity, hand: Hand): void {
   const s = grabbables.get(entity);
@@ -160,7 +216,7 @@ function forceGrab(entity: Entity, hand: Hand): void {
   const wasUnheld = s.heldBy.length === 0;
   s.heldBy.push(hand);
   handHeld.set(hand, s);
-  if (wasUnheld) { if (s.shielded) { s.shielded = false; s.shieldPose = undefined; } entity.collidable.set(false); }
+  if (wasUnheld) { if (s.shielded) { s.shielded = false; s.shieldPose = undefined; } entity.collidable.set(false); onGrabbed(s); }
   captureOffset(s);
   captureTwoHandStart(s);
   s.options.onGrab?.(hand);
@@ -280,7 +336,7 @@ function tryGrab(hand: Hand): void {
   const wasUnheld = nearest.heldBy.length === 0;
   nearest.heldBy.push(hand);
   handHeld.set(hand, nearest);
-  if (wasUnheld) { if (nearest.shielded) { nearest.shielded = false; nearest.shieldPose = undefined; } nearest.entity.collidable.set(false); }
+  if (wasUnheld) { if (nearest.shielded) { nearest.shielded = false; nearest.shieldPose = undefined; } nearest.entity.collidable.set(false); onGrabbed(nearest); }
   captureOffset(nearest);
   captureTwoHandStart(nearest);
   nearest.options.onGrab?.(hand);
@@ -297,16 +353,17 @@ function release(hand: Hand): void {
   // Fully released: restore collision, then snap into place if enabled.
   s.entity.collidable.set(s.collidablePref);
   if (s.snapEnabled) {
-    if (s.pendingSnap) {
-      s.entity.pos = s.pendingSnap.pos;
-      s.entity.rot = s.pendingSnap.rot;
-    } else {
-      s.entity.rot = snapRotation(s.entity.rot); // straighten in place when nothing is near
-    }
+    const finalPose = s.pendingSnap ?? gridPose(s); // [5] grid fallback when nothing was locked
+    s.entity.pos = finalPose.pos;
+    s.entity.rot = finalPose.rot;
     s.entity.velocity.set(Vector3.zero);
+    playSnapSound('place'); // [6]
   }
   destroyGhost(s);
   s.pendingSnap = undefined;
+  s.snapTargetEntity = undefined;
+  s.prevSnapValidTarget = undefined;
+  hashInsert(s); // [7] re-index at the placed position
   s.options.onRelease?.(hand);
 }
 
@@ -326,6 +383,7 @@ function onPhysicsUpdate(deltaTime: number) {
   grabbables.forEach((s) => {
     if (!s.entity.exists()) {
       if (s.heldBy.length > 0) { s.heldBy.forEach((h) => handHeld.set(h, undefined)); s.heldBy = []; }
+      hashRemove(s);
       return;
     }
 
@@ -344,6 +402,7 @@ function onPhysicsUpdate(deltaTime: number) {
     }
 
     if (bodyPos) { applyPlayerShield(s, bodyPos); }
+    reindexIfMoved(s); // [7] keep the hash correct for resized / nudged pieces
   });
 }
 
@@ -366,7 +425,9 @@ function snapRotation(q: Quaternion): Quaternion {
 }
 
 
-// --- object-to-object snapping ---------------------------------------------
+// ============================================================================
+// Horizon-style snapping
+// ============================================================================
 
 function absVec(v: Vector3): Vector3 { return new Vector3(Math.abs(v.x), Math.abs(v.y), Math.abs(v.z)); }
 function axisGet(v: Vector3, i: number): number { return i === 0 ? v.x : (i === 1 ? v.y : v.z); }
@@ -377,80 +438,192 @@ function nearestOf(target: number, options: number[]): number {
   return best;
 }
 
-/**
- * Best flush pose for `s` against a nearby object. Anchor-to-anchor, never
- * pivot-to-pivot: the held object contacts the target on the nearest face, and
- * its edges/corners line up on the other two axes (nearest of low/centre/high).
- * Rotation is straightened to the nearest 90 degrees. Returns undefined if no
- * object is within reach.
- */
-function computeSnapCandidate(s: GrabbableState): Pose | undefined {
-  const gbA = s.grabBox;
-  if (!gbA) { return undefined; }
-  const rotA = snapRotation(s.entity.rot);
-  const heA = absVec(rotA.rotateVector(gbA));
-  const cA = s.entity.pos;
 
-  let best: Pose | undefined;
-  let bestScore = maxSnapDistance;
+// --- [7] spatial hash of placed (unheld) pieces -----------------------------
+const spatialHash = new Map<string, Set<GrabbableState>>();
+function cellKey(x: number, y: number, z: number): string { return x + '_' + y + '_' + z; }
+function cellOf(p: Vector3): { x: number, y: number, z: number } { return { x: Math.floor(p.x / snapCellSize), y: Math.floor(p.y / snapCellSize), z: Math.floor(p.z / snapCellSize) }; }
 
-  grabbables.forEach((o) => {
-    const gbB = o.grabBox;
-    if (o === s || o.heldBy.length > 0 || !o.entity.exists() || !gbB) { return; }
-    const cB = o.entity.pos;
-    const delta = cA.subtract(cB);
-    if (delta.magnitude() > 2.0) { return; } // coarse reject
-    const heB = absVec(o.entity.rot.rotateVector(gbB));
-
-    // Contact axis = axis of greatest centre separation.
-    let k = 0;
-    if (Math.abs(delta.y) > Math.abs(axisGet(delta, k))) { k = 1; }
-    if (Math.abs(delta.z) > Math.abs(axisGet(delta, k))) { k = 2; }
-
-    const out = [cA.x, cA.y, cA.z];
-    for (let j = 0; j < 3; j++) {
-      if (j === k) {
-        const sign = axisGet(delta, j) >= 0 ? 1 : -1;
-        out[j] = axisGet(cB, j) + sign * (axisGet(heB, j) + axisGet(heA, j)); // flush faces
-      } else {
-        const lo = axisGet(cB, j) - axisGet(heB, j) + axisGet(heA, j); // low edges aligned
-        const ce = axisGet(cB, j);                                     // centred
-        const hi = axisGet(cB, j) + axisGet(heB, j) - axisGet(heA, j); // high edges aligned
-        out[j] = nearestOf(axisGet(cA, j), [lo, ce, hi]);
-      }
-    }
-
-    const pos = new Vector3(out[0], out[1], out[2]);
-    const disp = pos.subtract(cA).magnitude();
-    if (disp < bestScore) { bestScore = disp; best = { pos, rot: rotA }; }
-  });
-
-  return best;
+function hashInsert(s: GrabbableState): void {
+  if (s.inHash || !s.entity.exists()) { return; }
+  const c = cellOf(s.entity.pos);
+  const k = cellKey(c.x, c.y, c.z);
+  let set = spatialHash.get(k);
+  if (!set) { set = new Set(); spatialHash.set(k, set); }
+  set.add(s);
+  s.hashKey = k;
+  s.inHash = true;
 }
 
+function hashRemove(s: GrabbableState): void {
+  if (!s.inHash || s.hashKey === undefined) { s.inHash = false; s.hashKey = undefined; return; }
+  const set = spatialHash.get(s.hashKey);
+  if (set) { set.delete(s); if (set.size === 0) { spatialHash.delete(s.hashKey); } }
+  s.hashKey = undefined;
+  s.inHash = false;
+}
+
+// A placed piece can be moved without a grab (resize gizmo, duplicate). Cheap cell
+// compare keeps it in the right bucket. TODO: a fully incremental, multi-cell index
+// for very large pieces that straddle several cells.
+function reindexIfMoved(s: GrabbableState): void {
+  const c = cellOf(s.entity.pos);
+  const k = cellKey(c.x, c.y, c.z);
+  if (k !== s.hashKey) { hashRemove(s); hashInsert(s); }
+}
+
+function hashQuery(p: Vector3): GrabbableState[] {
+  const c = cellOf(p);
+  const out: GrabbableState[] = [];
+  for (let dx = -1; dx <= 1; dx++) {
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const set = spatialHash.get(cellKey(c.x + dx, c.y + dy, c.z + dz));
+        if (set) { set.forEach((s) => out.push(s)); }
+      }
+    }
+  }
+  return out;
+}
+
+
+// --- [4] flush + edge/corner pose, computed in the NEIGHBOUR's local frame ---
+function flushPoseInNeighbor(s: GrabbableState, gbA: Vector3, o: GrabbableState): Pose {
+  const gbB = o.grabBox!;
+  const rotB = o.entity.rot;
+  const cB = o.entity.pos;
+
+  const rel90 = snapRotation(rotB.inverse().multiply(s.entity.rot)); // A oriented to B's local 90s
+  const worldRot = rotB.multiply(rel90);
+  const heAL = absVec(rel90.rotateVector(gbA));                      // A half-extents in B-local axes
+  const localCA = rotB.inverse().rotateVector(s.entity.pos.subtract(cB)); // A centre in B-local
+
+  // Contact axis = axis of greatest separation in B-local (B's centre is the origin).
+  let k = 0;
+  if (Math.abs(localCA.y) > Math.abs(axisGet(localCA, k))) { k = 1; }
+  if (Math.abs(localCA.z) > Math.abs(axisGet(localCA, k))) { k = 2; }
+
+  const out = [localCA.x, localCA.y, localCA.z];
+  for (let j = 0; j < 3; j++) {
+    if (j === k) {
+      const sign = axisGet(localCA, j) >= 0 ? 1 : -1;
+      out[j] = sign * (axisGet(gbB, j) + axisGet(heAL, j)); // flush faces
+    } else {
+      const lo = -axisGet(gbB, j) + axisGet(heAL, j); // low edges aligned
+      const hi = axisGet(gbB, j) - axisGet(heAL, j);  // high edges aligned
+      out[j] = nearestOf(axisGet(localCA, j), [lo, 0, hi]); // 0 = centred
+    }
+  }
+
+  const worldPos = cB.add(rotB.rotateVector(new Vector3(out[0], out[1], out[2])));
+  return { pos: worldPos, rot: worldRot };
+}
+
+// --- [2] AABB overlap of a candidate pose against placed pieces --------------
+function poseOverlapsPlaced(pose: Pose, gbA: Vector3, self: GrabbableState, target: GrabbableState): boolean {
+  const heA = absVec(pose.rot.rotateVector(gbA));
+  const nearby = hashQuery(pose.pos);
+  for (const o of nearby) {
+    if (o === self || o === target || o.heldBy.length > 0 || !o.entity.exists() || !o.grabBox) { continue; }
+    const heB = absVec(o.entity.rot.rotateVector(o.grabBox));
+    const d = pose.pos.subtract(o.entity.pos);
+    if (Math.abs(d.x) < heA.x + heB.x - snapOverlapTolerance &&
+      Math.abs(d.y) < heA.y + heB.y - snapOverlapTolerance &&
+      Math.abs(d.z) < heA.z + heB.z - snapOverlapTolerance) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// --- [5] open-space fallback: grid position + 90 deg yaw ---------------------
+function gridPose(s: GrabbableState): Pose {
+  const rot = snapRotation(s.entity.rot);
+  const g = s.snapGrid > 0 ? s.snapGrid : defaultSnapGrid;
+  const p = s.entity.pos;
+  return { pos: new Vector3(Math.round(p.x / g) * g, Math.round(p.y / g) * g, Math.round(p.z / g) * g), rot };
+}
+
+
+type SnapResult = { display: Pose, apply: Pose, color: Color, lockedTarget: Entity | undefined };
+
+// The full snap decision for a held piece (items 1-5 combined).
+function computeSnap(s: GrabbableState): SnapResult {
+  const gbA = s.grabBox;
+  const grid = gridPose(s);
+  if (!gbA) { return { display: grid, apply: grid, color: ghostColorSearching, lockedTarget: undefined }; }
+
+  const cA = s.entity.pos;
+
+  // [1 + 7] gather compatible candidates from the spatial hash, score by distance moved.
+  const candidates: { pose: Pose, score: number, target: GrabbableState }[] = [];
+  hashQuery(cA).forEach((o) => {
+    if (o === s || o.heldBy.length > 0 || !o.entity.exists() || !o.grabBox) { return; }
+    if (!canSnap(s.snapCategory, o.snapCategory)) { return; }
+    const pose = flushPoseInNeighbor(s, gbA, o);
+    const score = pose.pos.distanceTo(cA);
+    if (score <= maxSnapDistance) { candidates.push({ pose, score, target: o }); }
+  });
+  candidates.sort((a, b) => a.score - b.score);
+
+  if (candidates.length === 0) {
+    s.snapTargetEntity = undefined;
+    return { display: grid, apply: grid, color: ghostColorSearching, lockedTarget: undefined };
+  }
+
+  // [3] hysteresis: keep the locked target unless a rival beats it by the margin.
+  let leader = candidates[0];
+  if (s.snapTargetEntity) {
+    const heldCand = candidates.find((c) => c.target.entity === s.snapTargetEntity);
+    if (heldCand && leader.target.entity !== heldCand.target.entity && leader.score >= heldCand.score * (1 - snapHysteresis)) {
+      leader = heldCand;
+    }
+  }
+
+  // [2] from the leader down, take the first pose that does not overlap a placed piece.
+  const ordered = [leader, ...candidates.filter((c) => c !== leader)];
+  let blocked: { pose: Pose, score: number, target: GrabbableState } | undefined;
+  for (const c of ordered) {
+    if (poseOverlapsPlaced(c.pose, gbA, s, c.target)) { if (!blocked) { blocked = c; } continue; }
+    s.snapTargetEntity = c.target.entity;
+    s.snapScore = c.score;
+    return { display: c.pose, apply: c.pose, color: ghostColorValid, lockedTarget: c.target.entity };
+  }
+
+  // Every compatible neighbour is occupied: show red at the blocked spot, place on the grid.
+  s.snapTargetEntity = undefined;
+  return { display: blocked ? blocked.pose : grid, apply: grid, color: ghostColorInvalid, lockedTarget: undefined };
+}
+
+
 function makeGhost(): Entity {
-  const g = spawnPrimitive.cube(Vector3.zero, Vector3.one, Quaternion.one, ghostColor, ghostAlpha, false, 'Empty', undefined);
+  const g = spawnPrimitive.cube(Vector3.zero, Vector3.one, Quaternion.one, ghostColorSearching, ghostAlpha, false, 'Empty', undefined);
   g.visible.set(false);
   return g;
 }
 
 function updateSnapPreview(s: GrabbableState): void {
-  const cand = computeSnapCandidate(s);
-  s.pendingSnap = cand;
+  const r = computeSnap(s);
+  s.pendingSnap = r.apply;
 
-  if (cand && s.grabBox) {
+  if (s.grabBox) {
     if (!s.snapGhost || !s.snapGhost.exists()) { s.snapGhost = makeGhost(); }
     s.snapGhost.visible.set(true);
-    s.snapGhost.pos = cand.pos;
-    s.snapGhost.rot = cand.rot;
+    s.snapGhost.pos = r.display.pos;
+    s.snapGhost.rot = r.display.rot;
     s.snapGhost.scale = new Vector3(s.grabBox.x * 2, s.grabBox.y * 2, s.grabBox.z * 2);
-  } else if (s.snapGhost && s.snapGhost.exists()) {
-    s.snapGhost.visible.set(false);
+    s.snapGhost.mesh.color.set(r.color, ghostAlpha); // [6] blue / green / red
   }
+
+  // [6] soft click the instant a NEW valid lock is acquired.
+  if (r.lockedTarget && r.lockedTarget !== s.prevSnapValidTarget) { playSnapSound('lock'); }
+  s.prevSnapValidTarget = r.lockedTarget;
 }
 
 function clearSnap(s: GrabbableState): void {
   s.pendingSnap = undefined;
+  s.snapTargetEntity = undefined;
+  s.prevSnapValidTarget = undefined;
   if (s.snapGhost && s.snapGhost.exists()) { s.snapGhost.visible.set(false); }
 }
 
@@ -458,6 +631,14 @@ function destroyGhost(s: GrabbableState): void {
   if (s.snapGhost && s.snapGhost.exists()) { s.snapGhost.destroy(); }
   s.snapGhost = undefined;
 }
+
+// [6] Audio hook. This engine exposes no audio API yet, so these are stubs.
+// TODO: play a soft click on 'lock' and a firmer click on 'place' once an engine
+// sound API (an AudioStreamPlayer-style wrapper) is available.
+function playSnapSound(kind: 'lock' | 'place'): void {
+  void kind; // intentionally empty until an audio API exists
+}
+
 
 function applyPlayerShield(s: GrabbableState, bodyPos: Vector3): boolean {
   if (!s.collidablePref) { return false; }

@@ -147,6 +147,9 @@ function spawnGrabbableShape(shape: Shape, pos: Vector3, scale: Vector3, rot: Qu
   grabbable.make(entity, grabReach, {
     grabBox: new Vector3(scale.x / 2, scale.y / 2, scale.z / 2),
     snapGrid: 0.1,
+    // Box pieces (Cube / Slab / Pillar) are 'wall'; round shapes are 'prop'. Edit
+    // the snapCompatibility table in Grabbable.ts to change what snaps to what.
+    snapCategory: shape === 'Cube' ? 'wall' : 'prop',
     onGrab: (hand) => console.log(hand + ' grabbed a ' + shape),
     onRelease: (hand) => console.log(hand + ' released a ' + shape),
   });
