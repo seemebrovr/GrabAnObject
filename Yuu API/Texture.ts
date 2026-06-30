@@ -18,7 +18,7 @@ export class Texture {
 
     this.width = width;
     this.height = height;
-  }
+  } //
 
   destroy() {
     if (this.imageID !== -1) {
